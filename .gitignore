@@ -1,0 +1,12 @@
+node_modules/*
+icon-generator/*
+
+.DS_Store
+*.log
+npm-debug.log*
+*.crx
+*.pem
+
+.env
+.env.local
+.env.*.local

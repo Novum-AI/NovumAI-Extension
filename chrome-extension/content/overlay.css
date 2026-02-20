@@ -1,0 +1,300 @@
+/* NovumAI Floating Overlay on Google Meet
+   Minimal CSS — Tailwind is NOT available in content scripts,
+   so we keep hand-written CSS here but use FA icons via content.js injection */
+
+#novumai-overlay {
+  position: fixed;
+  bottom: 100px;
+  right: 24px;
+  width: 360px;
+  max-height: 480px;
+  z-index: 999999;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  color: #e2e8f0;
+  pointer-events: auto;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+#novumai-overlay.novumai-hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(10px);
+}
+
+#novumai-overlay.novumai-collapsed {
+  width: auto;
+  max-height: none;
+}
+
+/* Panel */
+.novumai-panel {
+  background: rgba(15, 23, 42, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 16px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(99,102,241,0.08);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header */
+.novumai-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: rgba(30, 41, 59, 0.5);
+  cursor: grab;
+  user-select: none;
+  border-bottom: 1px solid rgba(99,102,241,0.12);
+}
+.novumai-header:active { cursor: grabbing; }
+
+.novumai-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.novumai-logo {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 11px;
+  color: #fff;
+}
+
+.novumai-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #e2e8f0;
+}
+
+.novumai-elapsed {
+  font-size: 11px;
+  color: #64748b;
+  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.novumai-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.novumai-btn-icon {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  font-size: 12px;
+  line-height: 1;
+}
+.novumai-btn-icon:hover {
+  background: rgba(99,102,241,0.12);
+  color: #c7d2fe;
+}
+
+/* Stage */
+.novumai-stage {
+  padding: 7px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(99,102,241,0.06);
+  border-bottom: 1px solid rgba(99,102,241,0.08);
+}
+
+.novumai-stage-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #6366f1;
+  animation: novumai-pulse 2s infinite;
+}
+
+@keyframes novumai-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.novumai-stage-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #a5b4fc;
+}
+
+.novumai-stage-name {
+  font-size: 12px;
+  color: #c7d2fe;
+  font-weight: 500;
+}
+
+/* Sentiment */
+.novumai-sentiment {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  font-size: 11px;
+  color: #94a3b8;
+  border-bottom: 1px solid rgba(99,102,241,0.06);
+}
+
+.novumai-sentiment-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  transition: background 0.3s;
+}
+.novumai-sentiment-dot.positive { background: #34d399; }
+.novumai-sentiment-dot.negative { background: #f87171; }
+.novumai-sentiment-dot.neutral { background: #94a3b8; }
+.novumai-sentiment-dot.excited { background: #fbbf24; }
+.novumai-sentiment-dot.confused { background: #fb923c; }
+.novumai-sentiment-dot.frustrated { background: #ef4444; }
+.novumai-sentiment-dot.skeptical { background: #f97316; }
+.novumai-sentiment-dot.interested { background: #22d3ee; }
+
+/* Suggestions */
+.novumai-suggestions {
+  padding: 10px 14px;
+  flex: 1;
+  overflow-y: auto;
+  max-height: 260px;
+  min-height: 50px;
+}
+.novumai-suggestions::-webkit-scrollbar { width: 3px; }
+.novumai-suggestions::-webkit-scrollbar-track { background: transparent; }
+.novumai-suggestions::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.25); border-radius: 2px; }
+
+.novumai-suggestion-item {
+  padding: 9px 11px;
+  border-radius: 10px;
+  margin-bottom: 6px;
+  line-height: 1.5;
+  font-size: 13px;
+}
+
+.novumai-suggestion-item.latest {
+  background: rgba(99,102,241,0.1);
+  border: 1px solid rgba(99,102,241,0.18);
+  color: #e2e8f0;
+}
+.novumai-suggestion-item.previous {
+  background: rgba(51,65,85,0.35);
+  border: 1px solid rgba(71,85,105,0.25);
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.novumai-suggestion-bullet {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.novumai-suggestion-bullet::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #818cf8;
+  margin-top: 6px;
+  flex-shrink: 0;
+}
+.novumai-suggestion-bullet:last-child { margin-bottom: 0; }
+
+/* Streaming cursor */
+.novumai-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  background: #818cf8;
+  margin-left: 2px;
+  animation: novumai-blink 0.8s infinite;
+  vertical-align: middle;
+}
+@keyframes novumai-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Empty state */
+.novumai-empty {
+  text-align: center;
+  padding: 20px 14px;
+  color: #64748b;
+  font-size: 13px;
+}
+.novumai-empty i { font-size: 28px; margin-bottom: 8px; display: block; opacity: 0.5; }
+
+/* Transcript line */
+.novumai-transcript-line {
+  font-size: 11px;
+  color: #64748b;
+  padding: 4px 14px;
+  border-top: 1px solid rgba(51,65,85,0.25);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.novumai-transcript-line .speaker { font-weight: 600; color: #94a3b8; }
+
+/* Collapsed pill */
+.novumai-pill {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(15,23,42,0.92);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(99,102,241,0.25);
+  border-radius: 24px;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  transition: transform 0.15s;
+}
+.novumai-pill:hover { transform: scale(1.03); }
+
+#novumai-overlay.novumai-collapsed .novumai-panel { display: none; }
+#novumai-overlay.novumai-collapsed .novumai-pill { display: flex; }
+
+.novumai-pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6366f1;
+  animation: novumai-pulse 2s infinite;
+}
+.novumai-pill-text { font-size: 12px; font-weight: 500; color: #e2e8f0; }
+
+/* Dragging */
+#novumai-overlay.novumai-dragging { opacity: 0.85; transition: none; }
+
+/* Quota warning */
+.novumai-quota-warning {
+  padding: 7px 14px;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: center;
+  background: rgba(239,68,68,0.12);
+  color: #f87171;
+}

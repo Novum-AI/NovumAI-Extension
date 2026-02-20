@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "NovumAI - Real-Time Sales Coaching",
+  "version": "1.0.0",
+  "description": "AI-powered real-time sales coaching on Google Meet. Get methodology-based suggestions during your calls.",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "activeTab",
+    "storage",
+    "cookies",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.novumai.co/*",
+    "https://streaming.assemblyai.com/*",
+    "https://*.execute-api.us-west-2.amazonaws.com/*",
+    "https://meet.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon-16.png",
+      "32": "assets/icons/icon-32.png",
+      "48": "assets/icons/icon-48.png",
+      "128": "assets/icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "assets/icons/icon-16.png",
+    "32": "assets/icons/icon-32.png",
+    "48": "assets/icons/icon-48.png",
+    "128": "assets/icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content/content.js"],
+      "css": ["content/overlay.css", "lib/fontawesome/fontawesome.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "offscreen/offscreen.html",
+        "offscreen/pcm-processor-tab.js",
+        "offscreen/pcm-processor-mic.js",
+        "assets/*",
+        "lib/fontawesome/*",
+        "lib/fontawesome/webfonts/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

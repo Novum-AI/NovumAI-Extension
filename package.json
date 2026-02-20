@@ -1,0 +1,21 @@
+{
+  "name": "novumai-extension",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build:css": "npx tailwindcss -i src/input.css -o chrome-extension/popup/tailwind.css --minify",
+    "watch:css": "npx tailwindcss -i src/input.css -o chrome-extension/popup/tailwind.css --watch",
+    "build": "npm run build:css"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "tailwindcss": "^3.4.19"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^7.2.0"
+  }
+}
