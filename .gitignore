@@ -1,5 +1,7 @@
-node_modules/*
-icon-generator/*
+node_modules/
+
+AUDIT_SUMMARY.md
+icon-generator/
 
 .DS_Store
 *.log
