@@ -1,19 +1,22 @@
 // NovumAI Offscreen Document
-// Handles audio capture and PCM16 conversion
+// Handles TAB audio capture and PCM16 conversion
 // Runs in an offscreen document because service workers can't use AudioContext
+// NOTE: Mic capture is handled by the content script (not here) because
+// getUserMedia in offscreen docs can't trigger the browser permission prompt.
 
 import { MSG } from '../lib/messages.js';
 import { CONFIG } from '../lib/config.js';
+import { debug } from '../lib/debug.js';
+
+const log = debug('Offscreen');
 
 let tabAudioContext = null;
-let micAudioContext = null;
 let playbackAudioEl = null; // <audio> element for reliable tab audio playback
 let playbackStream = null; // Cloned stream for playback (separate from processing stream)
 let playbackHealthTimer = null;
 let tabMediaStream = null;
-let micMediaStream = null;
 let tabProcessorNode = null;
-let micProcessorNode = null;
+let audioHealthTimer = null;
 
 // ─── Base64 Encoding ─────────────────────────────────────────────────────────
 // ArrayBuffer cannot survive chrome.runtime.sendMessage JSON serialization.
@@ -64,6 +67,7 @@ function createPcmScriptProcessor(audioCtx, streamType, onChunk) {
 
 async function startTabAudioCapture(streamId) {
   try {
+    log.info('Starting tab audio capture with streamId:', streamId?.substring(0, 20) + '...');
     // Get tab audio stream using the streamId from chrome.tabCapture
     tabMediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -128,43 +132,24 @@ async function startTabAudioCapture(streamId) {
   }
 }
 
-// ─── Microphone Capture ─────────────────────────────────────────────────────
+// ─── Audio Health Reporting ──────────────────────────────────────────────────
 
-async function startMicCapture() {
-  try {
-    micMediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        sampleRate: CONFIG.SAMPLE_RATE,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+function startAudioHealthReporting() {
+  if (audioHealthTimer) clearInterval(audioHealthTimer);
+  audioHealthTimer = setInterval(() => {
+    const tabActive = tabMediaStream?.active ?? false;
+    const tabTrackLive = tabMediaStream?.getAudioTracks()[0]?.readyState === 'live';
+
+    chrome.runtime.sendMessage({
+      type: MSG.AUDIO_HEALTH,
+      target: 'background',
+      data: {
+        tabAudio: tabActive && tabTrackLive,
+        tabContextState: tabAudioContext?.state || 'closed',
+        // micAudio is reported by content script, not offscreen
       },
-      video: false,
-    });
-
-    micAudioContext = new AudioContext({ sampleRate: CONFIG.SAMPLE_RATE });
-    if (micAudioContext.state === 'suspended') {
-      await micAudioContext.resume();
-    }
-
-    const source = micAudioContext.createMediaStreamSource(micMediaStream);
-    micProcessorNode = createPcmScriptProcessor(micAudioContext, 'mic', (audioData) => {
-      const base64Audio = arrayBufferToBase64(audioData);
-      chrome.runtime.sendMessage({
-        type: MSG.MIC_AUDIO_CHUNK,
-        target: 'background',
-        data: { audioData: base64Audio },
-      }).catch(() => {});
-    });
-    source.connect(micProcessorNode);
-    micProcessorNode.connect(micAudioContext.destination);
-
-    console.log('[NovumAI Offscreen] Mic capture started');
-  } catch (e) {
-    console.error('[NovumAI Offscreen] Mic capture failed:', e);
-    // Mic failure is non-fatal - tab audio still works
-  }
+    }).catch(() => {});
+  }, 3000);
 }
 
 // ─── Cleanup ────────────────────────────────────────────────────────────────
@@ -198,19 +183,9 @@ function stopAllCapture() {
     playbackStream = null;
   }
 
-  // Mic audio
-  if (micProcessorNode) {
-    micProcessorNode.onaudioprocess = null;
-    micProcessorNode.disconnect();
-    micProcessorNode = null;
-  }
-  if (micMediaStream) {
-    micMediaStream.getTracks().forEach((t) => t.stop());
-    micMediaStream = null;
-  }
-  if (micAudioContext) {
-    micAudioContext.close().catch(() => {});
-    micAudioContext = null;
+  if (audioHealthTimer) {
+    clearInterval(audioHealthTimer);
+    audioHealthTimer = null;
   }
 
   console.log('[NovumAI Offscreen] All capture stopped');
@@ -227,7 +202,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         await startTabAudioCapture(streamId);
-        await startMicCapture();
+        startAudioHealthReporting();
         sendResponse({ success: true });
       } catch (e) {
         // Clean up any partially started resources to release the tab stream

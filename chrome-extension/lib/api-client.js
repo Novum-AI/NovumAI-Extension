@@ -75,6 +75,23 @@ class ApiClient {
     return this.post(path, data);
   }
 
+  // Leads
+  // General search: partial match across phone, name, email, company (min 2 chars)
+  async searchLeads(query) {
+    const path = `${CONFIG.LEADS_SEARCH_ENDPOINT}?search=${encodeURIComponent(query)}&limit=5`;
+    return this.get(path);
+  }
+
+  // Exact E.164 phone lookup (requires full +15551234567 format)
+  async lookupLeadByPhone(phoneNumber) {
+    const path = CONFIG.LEADS_PHONE_LOOKUP_ENDPOINT.replace('{phoneNumber}', encodeURIComponent(phoneNumber));
+    return this.get(path);
+  }
+
+  async createLead(data) {
+    return this.post(CONFIG.LEADS_CREATE_ENDPOINT, data);
+  }
+
   // Session cookie check
   async getSessionCookie() {
     try {

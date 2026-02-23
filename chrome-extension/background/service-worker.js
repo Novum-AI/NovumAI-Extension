@@ -4,6 +4,9 @@
 import { CONFIG, getApiBaseUrl, getWsUrl, getEnvironment } from '../lib/config.js';
 import { MSG } from '../lib/messages.js';
 import { apiClient } from '../lib/api-client.js';
+import { debug } from '../lib/debug.js';
+
+const log = debug('SW');
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -18,6 +21,7 @@ let sessionState = {
   suggestionsEnabled: true,
   sequenceNumber: 0,
   elapsedSeconds: 0,
+  lead: null, // { lead_id, first_name, last_name, company_name, customer_number, ... }
 };
 
 let backendWs = null;
@@ -32,13 +36,16 @@ let offscreenCreated = false;
 
 async function checkAuth() {
   try {
+    log.info('Checking auth...');
     const cookie = await apiClient.getSessionCookie();
     if (!cookie) {
+      log.info('No session cookie found');
       sessionState.isAuthenticated = false;
       sessionState.user = null;
       sessionState.company = null;
       return { authenticated: false };
     }
+    log.info('Session cookie found, verifying with API...');
 
     const [meResult, companyResult] = await Promise.allSettled([
       apiClient.getMe(),
@@ -54,6 +61,7 @@ async function checkAuth() {
         sessionState.company = companyResult.value;
       }
 
+      log.info('Auth verified', { userId: meResult.value.user_id, email: meResult.value.email });
       return {
         authenticated: true,
         user: sessionState.user,
@@ -61,12 +69,13 @@ async function checkAuth() {
       };
     }
 
+    log.warn('Auth API call failed or no user_id', { meResult: meResult.status, meValue: meResult.value });
     sessionState.isAuthenticated = false;
     sessionState.user = null;
     sessionState.company = null;
     return { authenticated: false };
   } catch (e) {
-    console.error('[NovumAI] Auth check failed:', e);
+    log.error('Auth check failed:', e);
     sessionState.isAuthenticated = false;
     sessionState.user = null;
     sessionState.company = null;
@@ -259,6 +268,10 @@ async function connectBackendWs() {
     backendWs.onopen = () => {
       console.log('[NovumAI] Backend WebSocket connected');
       flushRetryQueue();
+      broadcastToContent({
+        type: MSG.CONNECTION_STATUS,
+        data: { connected: true },
+      });
       resolve();
     };
     backendWs.onerror = (e) => {
@@ -294,6 +307,10 @@ async function connectBackendWs() {
 
     // Auto-reconnect if session is active
     if (sessionState.activeSession) {
+      broadcastToContent({
+        type: MSG.CONNECTION_STATUS,
+        data: { connected: false, code: e.code, reconnecting: true },
+      });
       setTimeout(() => connectBackendWs(), 3000);
     }
   };
@@ -350,7 +367,16 @@ function handleBackendMessage(msg) {
   } else if (type === 'SMART_SUGGESTIONS_LIMIT_REACHED') {
     broadcastToContent({
       type: MSG.QUOTA_EXCEEDED,
-      data: msg.payload,
+      data: { ...msg.payload, percentage: 100 },
+    });
+  } else if (type === 'QUOTA_WARNING') {
+    broadcastToContent({
+      type: MSG.QUOTA_WARNING,
+      data: {
+        percentage: msg.percentage,
+        message: msg.message,
+        remaining: msg.remaining,
+      },
     });
   } else if (type === 'PROFILE_INCOMPLETE') {
     broadcastToContent({
@@ -375,7 +401,11 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
     audioEnd,
     wsConnectionId: sessionState.activeSession.wsConnectionId || '',
     callConnectionId: sessionState.activeSession.callConnectionId,
-    customerId: 'extension-call',
+    customerId: sessionState.lead?.lead_id || sessionState.lead?.customer_number || 'extension-call',
+    customerName: sessionState.lead
+      ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim()
+      : '',
+    leadId: sessionState.lead?.lead_id || '',
     agentId: sessionState.user?.user_id,
     message_id: messageId,
     speaker,
@@ -431,6 +461,8 @@ function flushRetryQueue() {
 // ─── Session Lifecycle ──────────────────────────────────────────────────────
 
 async function startSession(tabId) {
+  log.always('Starting session', { tabId, lead: sessionState.lead?.customer_number || 'none' });
+
   if (sessionState.activeSession) {
     throw new Error('Session already active');
   }
@@ -441,6 +473,7 @@ async function startSession(tabId) {
   }
 
   const callConnectionId = `ext-${crypto.randomUUID()}`;
+  log.info('Call connection ID:', callConnectionId);
 
   // Reset state
   sessionState.sequenceNumber = 0;
@@ -455,21 +488,34 @@ async function startSession(tabId) {
 
   try {
     // 1. Connect backend WebSocket
+    log.info('Step 1/3: Connecting backend WebSocket...');
     await connectBackendWs();
     backendWsStarted = true;
+    log.info('Step 1/3: ✓ Backend WS connected');
 
     // 2. Start tab capture → offscreen audio processing
+    log.info('Step 2/3: Starting tab capture...');
     await startTabCapture(tabId);
     tabCaptureStarted = true;
+    log.info('Step 2/3: ✓ Tab capture started');
+
+    // 2b. Start mic capture in content script (non-blocking — mic failure is non-fatal)
+    log.info('Step 2b: Starting mic capture in content script...');
+    broadcastToContent({ type: MSG.START_MIC_CAPTURE });
+    log.info('Step 2b: Mic capture request sent to content script');
 
     // 3. Connect AssemblyAI for both streams
+    log.info('Step 3/3: Connecting AssemblyAI...');
     assemblyAiCustomerWs = await connectAssemblyAI('customer');
     customerWsStarted = true;
+    log.info('Step 3/3: ✓ AssemblyAI customer connected');
     assemblyAiAgentWs = await connectAssemblyAI('agent');
     agentWsStarted = true;
+    log.info('Step 3/3: ✓ AssemblyAI agent connected');
   } catch (e) {
     // Roll back any resources that were started
-    console.error('[NovumAI] Session startup failed, rolling back:', e);
+    log.error('Session startup failed, rolling back:', e.message);
+    log.info('Rollback state:', { backendWsStarted, tabCaptureStarted, customerWsStarted, agentWsStarted });
 
     if (agentWsStarted && assemblyAiAgentWs) {
       assemblyAiAgentWs.close();
@@ -495,7 +541,11 @@ async function startSession(tabId) {
     await apiClient.createCall({
       callConnectionId,
       direction: 'outbound',
-      customer_number: 'extension-call',
+      customer_number: sessionState.lead?.customer_number || 'extension-call',
+      lead_id: sessionState.lead?.lead_id || null,
+      customer_name: sessionState.lead
+        ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim()
+        : null,
       start_time: new Date().toISOString(),
     });
   } catch (e) {
@@ -542,6 +592,7 @@ async function endSession() {
 
   // Stop audio capture
   stopTabCapture();
+  broadcastToContent({ type: MSG.STOP_MIC_CAPTURE });
 
   // Close AssemblyAI connections
   if (assemblyAiCustomerWs) {
@@ -578,6 +629,8 @@ async function endSession() {
     await apiClient.endCall(callConnectionId, {
       status: 'ended',
       message_type: 'CALL_ENDED',
+      end_time: new Date().toISOString(),
+      duration_seconds: summary.durationSeconds,
     });
   } catch (e) {
     console.warn('[NovumAI] Call end API failed:', e);
@@ -593,9 +646,7 @@ async function endSession() {
 
   // Open post-call analytics on the webapp
   const env = await getEnvironment();
-  const webappBase = env === 'production'
-    ? CONFIG.WEBAPP_URL_PROD
-    : CONFIG.WEBAPP_URL_DEV;
+  const webappBase = env === 'production' ? CONFIG.WEBAPP_URL_PROD : CONFIG.WEBAPP_URL_DEV;
   const analyticsUrl = `${webappBase}/call-analytics/${callConnectionId}`;
   chrome.tabs.create({ url: analyticsUrl });
 
@@ -606,10 +657,23 @@ async function endSession() {
 
 // ─── Content Script Communication ───────────────────────────────────────────
 
-function broadcastToContent(message) {
+function broadcastToContent(message, retries = 0) {
   chrome.tabs.query({ url: 'https://meet.google.com/*' }, (tabs) => {
+    if (tabs.length === 0 && retries < 3) {
+      // Content script tab not found yet, retry after a short delay
+      setTimeout(() => broadcastToContent(message, retries + 1), 500);
+      return;
+    }
     for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+      chrome.tabs.sendMessage(tab.id, message).catch((err) => {
+        // Content script may not be ready yet — retry once for critical messages
+        if (retries < 2 && (message.type === MSG.SESSION_STARTED || message.type === MSG.SESSION_ENDED)) {
+          console.warn(`[NovumAI] Broadcast to tab ${tab.id} failed, retrying:`, err.message);
+          setTimeout(() => {
+            chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+          }, 1000);
+        }
+      });
     }
   });
 }
@@ -653,6 +717,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+// Flatten nested lead API response { core: {...}, local_fields: {...} } into
+// a flat object the popup can use (e.g. lead.first_name, lead.company_name).
+// If the lead is already flat (e.g. from CREATE_LEAD), return it unchanged.
+function flattenLead(raw) {
+  if (!raw || !raw.core) return raw; // already flat or null
+  const c = raw.core || {};
+  const lf = raw.local_fields || {};
+  return {
+    lead_id: c.id || lf.lead_id,
+    first_name: c.first_name || null,
+    last_name: c.last_name || null,
+    email: c.email || null,
+    customer_number: lf.customer_number || c.phone || null,
+    company_name: c.company || lf.company_name || null,
+    job_title: lf.job_title || null,
+    source: lf.source || c.source_type || null,
+    status: c.status || null,
+    tags: c.tags || [],
+    notes: c.notes || null,
+    created_at: c.created_at || null,
+  };
+}
+
 const messageHandlers = {
   [MSG.CHECK_AUTH]: async (msg, sender, sendResponse) => {
     const result = await checkAuth();
@@ -663,11 +750,20 @@ const messageHandlers = {
     try {
       const tabId = msg.data?.tabId;
       if (!tabId) throw new Error('No tab ID provided');
+      log.event('START_SESSION received', { tabId, hasLead: !!msg.data?.lead });
+
+      // Store lead data if provided
+      if (msg.data?.lead) {
+        sessionState.lead = msg.data.lead;
+        log.info('Lead attached to session', { leadId: msg.data.lead.lead_id, phone: msg.data.lead.customer_number });
+      }
+
       const result = await startSession(tabId);
+      log.always('Session started successfully', result);
       sendResponse({ success: true, ...result });
       broadcastToContent({ type: MSG.SESSION_STARTED, data: result });
     } catch (e) {
-      console.error('[NovumAI] Start session error:', e);
+      log.error('Start session error:', e.message);
       sendResponse({ success: false, error: e.message });
     }
   },
@@ -694,6 +790,7 @@ const messageHandlers = {
       businessMode: sessionState.businessMode,
       contentMode: sessionState.contentMode,
       suggestionsEnabled: sessionState.suggestionsEnabled,
+      lead: sessionState.lead,
     });
   },
 
@@ -727,6 +824,64 @@ const messageHandlers = {
   [MSG.OFFSCREEN_READY]: (msg, sender, sendResponse) => {
     console.log('[NovumAI] Offscreen document ready');
     sendResponse({ success: true });
+  },
+
+  [MSG.MIC_PERMISSION_GRANTED]: (msg, sender, sendResponse) => {
+    log.always('Microphone permission granted by user');
+    sendResponse({ success: true });
+  },
+
+  // Leads — uses general search endpoint (partial match on phone/name/email/company)
+  // API returns nested { core: {...}, local_fields: {...} } — flatten for popup consumption.
+  [MSG.SEARCH_LEADS]: async (msg, sender, sendResponse) => {
+    const query = msg.data.query || msg.data.phoneNumber || '';
+    log.info('Searching leads:', query);
+    try {
+      const result = await apiClient.searchLeads(query);
+      // The general endpoint returns { leads: [...], total_count, last_key }
+      const rawLeads = result?.leads || [];
+      const leads = rawLeads.map(flattenLead);
+      log.info('Lead search result:', { count: leads.length });
+      if (leads.length === 1) {
+        // Single match — auto-select
+        sendResponse({ success: true, lead: leads[0], leads });
+      } else if (leads.length > 1) {
+        // Multiple matches — let popup show list
+        sendResponse({ success: true, lead: null, leads });
+      } else {
+        sendResponse({ success: true, lead: null, leads: [] });
+      }
+    } catch (e) {
+      log.error('Lead search failed:', e.message);
+      sendResponse({ success: false, error: e.message });
+    }
+  },
+
+  [MSG.CREATE_LEAD]: async (msg, sender, sendResponse) => {
+    log.info('Creating lead:', { name: `${msg.data.first_name} ${msg.data.last_name}`, phone: msg.data.customer_number });
+    try {
+      const result = await apiClient.createLead(msg.data);
+      const lead = flattenLead(result);
+      log.info('Lead created:', { leadId: lead?.id });
+      sendResponse({ success: true, lead });
+    } catch (e) {
+      log.error('Lead creation failed:', e.message);
+      sendResponse({ success: false, error: e.message });
+    }
+  },
+
+  [MSG.SET_LEAD]: (msg, sender, sendResponse) => {
+    sessionState.lead = msg.data?.lead || null;
+    log.info('Lead set:', sessionState.lead ? { leadId: sessionState.lead.lead_id, phone: sessionState.lead.customer_number } : 'cleared');
+    sendResponse({ success: true });
+  },
+
+  // Audio health (forwarded from offscreen to content script)
+  [MSG.AUDIO_HEALTH]: (msg) => {
+    broadcastToContent({
+      type: MSG.AUDIO_HEALTH,
+      data: msg.data,
+    });
   },
 };
 

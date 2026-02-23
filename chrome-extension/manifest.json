@@ -40,7 +40,7 @@
     {
       "matches": ["https://meet.google.com/*"],
       "js": ["content/content.js"],
-      "css": ["content/overlay.css", "lib/fontawesome/fontawesome.css"],
+      "css": ["content/overlay.css"],
       "run_at": "document_idle"
     }
   ],
@@ -50,9 +50,7 @@
         "offscreen/offscreen.html",
         "offscreen/pcm-processor-tab.js",
         "offscreen/pcm-processor-mic.js",
-        "assets/*",
-        "lib/fontawesome/*",
-        "lib/fontawesome/webfonts/*"
+        "assets/*"
       ],
       "matches": ["<all_urls>"]
     }

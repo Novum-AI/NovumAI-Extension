@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="tailwind.css">
   <link rel="stylesheet" href="../lib/fontawesome/fontawesome.css">
   <style>
-    body { width: 360px; min-height: 220px; }
+    body { width: 360px; min-height: 320px; }
     .hidden { display: none !important; }
   </style>
 </head>
@@ -67,12 +67,36 @@
           </div>
         </div>
 
+        <!-- Lead Selection -->
+        <div class="mb-4">
+          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2 block">Customer / Lead</label>
+          <div class="flex gap-2 mb-2">
+            <input id="lead-phone" type="text" placeholder="Search by name, phone, email, or company..."
+              class="flex-1 px-3 py-2 border border-slate-700 rounded-lg bg-slate-800 text-slate-200 text-sm placeholder-slate-500 outline-none focus:border-novum-500 transition-colors">
+            <button id="btn-search-lead" class="px-3 py-2 rounded-lg bg-slate-700 text-slate-300 text-sm hover:bg-slate-600 transition-colors" title="Search">
+              <i class="fa-solid fa-magnifying-glass"></i>
+            </button>
+          </div>
+          <div id="lead-result" class="hidden"></div>
+          <div id="lead-create-form" class="hidden"></div>
+        </div>
+
         <!-- Content Mode -->
-        <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center justify-between mb-3">
           <label class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Content Mode</label>
           <select id="content-mode" class="px-2 py-1 border border-slate-700 rounded-md bg-slate-800 text-slate-200 text-xs cursor-pointer outline-none">
             <option value="bullets">Bullet Points</option>
             <option value="notes">Detailed Notes</option>
+          </select>
+        </div>
+
+        <!-- Business Mode -->
+        <div class="flex items-center justify-between mb-4">
+          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Business Mode</label>
+          <select id="business-mode" class="px-2 py-1 border border-slate-700 rounded-md bg-slate-800 text-slate-200 text-xs cursor-pointer outline-none">
+            <option value="sales">Sales</option>
+            <option value="customer_support">Customer Service</option>
+            <option value="general">General</option>
           </select>
         </div>
 

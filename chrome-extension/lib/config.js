@@ -28,6 +28,11 @@ export const CONFIG = {
   CALLS_ENDPOINT: '/api/calls/',
   CALLS_END_ENDPOINT: '/api/calls/{callConnectionId}/end',
 
+  // Leads
+  LEADS_SEARCH_ENDPOINT: '/api/leads/',           // GET ?search=term (partial match across phone/name/email/company)
+  LEADS_PHONE_LOOKUP_ENDPOINT: '/api/leads/phone/{phoneNumber}',  // GET exact E.164 phone lookup
+  LEADS_CREATE_ENDPOINT: '/api/leads/',
+
   // Audio
   SAMPLE_RATE: 16000,
   ENCODING: 'pcm_s16le',
@@ -69,10 +74,18 @@ export async function getEnvironment() {
 
 export async function getApiBaseUrl() {
   const env = await getEnvironment();
-  return env === 'production' ? CONFIG.API_BASE_URL_PROD : CONFIG.API_BASE_URL_DEV;
+  if (env === 'production') return CONFIG.API_BASE_URL_PROD;
+  return CONFIG.API_BASE_URL_DEV;
 }
 
 export async function getWsUrl() {
   const env = await getEnvironment();
-  return env === 'production' ? CONFIG.WS_URL_PROD : CONFIG.WS_URL_DEV;
+  if (env === 'production') return CONFIG.WS_URL_PROD;
+  return CONFIG.WS_URL_DEV;
+}
+
+export async function getWebappUrl() {
+  const env = await getEnvironment();
+  if (env === 'production') return CONFIG.WEBAPP_URL_PROD;
+  return CONFIG.WEBAPP_URL_DEV;
 }
