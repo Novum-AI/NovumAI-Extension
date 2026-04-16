@@ -22,6 +22,8 @@ let sessionState = {
   sequenceNumber: 0,
   elapsedSeconds: 0,
   lead: null, // { lead_id, first_name, last_name, company_name, customer_number, ... }
+  entityId: null, // Captured from createCall response (unified CRM entity)
+  callDirection: 'outbound', // Extension calls are always outbound
 };
 
 let backendWs = null;
@@ -252,6 +254,27 @@ function handleAssemblyAIMessage(streamType, msg) {
   }
 }
 
+// ─── WebSocket Token Helpers ────────────────────────────────────────────────
+
+function encodeWsSubprotocolToken(token) {
+  // Match frontend: base64url encode, wrap as novum.<b64>
+  const binary = new TextEncoder().encode(token);
+  let b64 = '';
+  for (let i = 0; i < binary.length; i++) {
+    b64 += String.fromCharCode(binary[i]);
+  }
+  b64 = btoa(b64)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `novum.${b64}`;
+}
+
+async function fetchWsToken() {
+  const { token } = await apiClient.getWebSocketToken();
+  return token;
+}
+
 // ─── NovumAI Backend WebSocket ──────────────────────────────────────────────
 
 async function connectBackendWs() {
@@ -259,14 +282,16 @@ async function connectBackendWs() {
   const agentId = sessionState.user?.user_id;
   if (!agentId) throw new Error('No user ID for WebSocket connection');
 
-  const fullUrl = `${wsUrl}?agentID=${agentId}`;
+  // Fetch a fresh HMAC token and encode as subprotocol
+  const wsToken = await fetchWsToken();
+  const subprotocol = encodeWsSubprotocolToken(wsToken);
 
-  backendWs = new WebSocket(fullUrl);
+  backendWs = new WebSocket(wsUrl, [subprotocol]);
 
   // Wait for backend WS to actually open
   await new Promise((resolve, reject) => {
     backendWs.onopen = () => {
-      console.log('[NovumAI] Backend WebSocket connected');
+      console.log('[NovumAI] Backend WebSocket connected (token auth)');
       flushRetryQueue();
       broadcastToContent({
         type: MSG.CONNECTION_STATUS,
@@ -305,7 +330,7 @@ async function connectBackendWs() {
     console.log(`[NovumAI] Backend WS closed: ${e.code}`);
     backendWs = null;
 
-    // Auto-reconnect if session is active
+    // Auto-reconnect if session is active (fetches a fresh token)
     if (sessionState.activeSession) {
       broadcastToContent({
         type: MSG.CONNECTION_STATUS,
@@ -401,17 +426,17 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
     audioEnd,
     wsConnectionId: sessionState.activeSession.wsConnectionId || '',
     callConnectionId: sessionState.activeSession.callConnectionId,
-    customerId: sessionState.lead?.lead_id || sessionState.lead?.customer_number || 'extension-call',
-    customerName: sessionState.lead
-      ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim()
-      : '',
+    customerId: sessionState.lead?.lead_id || sessionState.lead?.customer_number || '',
     leadId: sessionState.lead?.lead_id || '',
+    entityId: sessionState.entityId || undefined,
     agentId: sessionState.user?.user_id,
     message_id: messageId,
     speaker,
     businessMode: sessionState.businessMode,
     contentMode: sessionState.contentMode,
     currentCallStage: sessionState.currentStage,
+    lastSuggestionStage: sessionState.currentStage || '',
+    callDirection: sessionState.callDirection || '',
     companyId: sessionState.company?.id || sessionState.user?.company_id || '',
     companyProfile: sessionState.company?.companyProfile || {},
     companyName: sessionState.company?.name || '',
@@ -538,16 +563,17 @@ async function startSession(tabId) {
 
   // 4. Create call record on backend (non-blocking)
   try {
-    await apiClient.createCall({
+    const callResponse = await apiClient.createCall({
       callConnectionId,
       direction: 'outbound',
-      customer_number: sessionState.lead?.customer_number || 'extension-call',
-      lead_id: sessionState.lead?.lead_id || null,
-      customer_name: sessionState.lead
-        ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim()
-        : null,
-      start_time: new Date().toISOString(),
+      customerNumber: sessionState.lead?.customer_number || null,
+      leadId: sessionState.lead?.lead_id || null,
+      startTime: new Date().toISOString(),
     });
+    // Capture entityId from backend response for transcript payloads and endCall
+    if (callResponse?.entityId) {
+      sessionState.entityId = callResponse.entityId;
+    }
   } catch (e) {
     console.warn('[NovumAI] Call creation failed (non-blocking):', e);
   }
@@ -613,9 +639,18 @@ async function endSession() {
     stagesReached: sessionState.currentStage,
   };
 
+  // Capture values needed for endCall before clearing state
+  const endCallLeadId = sessionState.lead?.lead_id || null;
+  const endCallLeadName = sessionState.lead
+    ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim() || null
+    : null;
+  const endCallEntityId = sessionState.entityId || null;
+  const endCallTime = new Date().toISOString();
+
   // Clear activeSession BEFORE closing backend WS to prevent reconnect race
   sessionState.activeSession = null;
   sessionState.sequenceNumber = 0;
+  sessionState.entityId = null;
   retryQueue = [];
 
   // Clear retry poll timer
@@ -628,9 +663,11 @@ async function endSession() {
   try {
     await apiClient.endCall(callConnectionId, {
       status: 'ended',
-      message_type: 'CALL_ENDED',
-      end_time: new Date().toISOString(),
-      duration_seconds: summary.durationSeconds,
+      messageType: 'CALL_ENDED',
+      endTime: endCallTime,
+      leadId: endCallLeadId,
+      leadName: endCallLeadName,
+      entityId: endCallEntityId,
     });
   } catch (e) {
     console.warn('[NovumAI] Call end API failed:', e);

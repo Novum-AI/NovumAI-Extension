@@ -28,9 +28,15 @@ export const CONFIG = {
   CALLS_ENDPOINT: '/api/calls/',
   CALLS_END_ENDPOINT: '/api/calls/{callConnectionId}/end',
 
+  // WebSocket token
+  WEBSOCKET_TOKEN_ENDPOINT: '/api/users/websocket-token',
+
+  // CRM entity resolution (unified SF + local leads)
+  CRM_ENTITY_PHONE_ENDPOINT: '/api/crm/entities/phone/{phoneNumber}',
+
   // Leads
   LEADS_SEARCH_ENDPOINT: '/api/leads/',           // GET ?search=term (partial match across phone/name/email/company)
-  LEADS_PHONE_LOOKUP_ENDPOINT: '/api/leads/phone/{phoneNumber}',  // GET exact E.164 phone lookup
+  LEADS_PHONE_LOOKUP_ENDPOINT: '/api/leads/phone/{phoneNumber}',  // GET exact E.164 phone lookup (local only)
   LEADS_CREATE_ENDPOINT: '/api/leads/',
 
   // Audio
