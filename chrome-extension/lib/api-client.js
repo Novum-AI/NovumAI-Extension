@@ -102,10 +102,12 @@ class ApiClient {
     });
   }
 
-  // Leads
-  // General search: partial match across phone, name, email, company (min 2 chars)
+  // Unified CRM entity search (min 2 chars). Backend picks the source:
+  // SF-connected orgs → SOSL across Contact/Lead/Account; everyone else →
+  // local LeadsTable. Returns { entities: [{ entity_id, entity_type,
+  // source_type, first_name, last_name, email, phone, company, ... }] }.
   async searchLeads(query) {
-    const path = `${CONFIG.LEADS_SEARCH_ENDPOINT}?search=${encodeURIComponent(query)}&limit=5`;
+    const path = `${CONFIG.CRM_ENTITY_SEARCH_ENDPOINT}?q=${encodeURIComponent(query)}&limit=5`;
     return this.get(path);
   }
 

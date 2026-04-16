@@ -914,27 +914,61 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // async response
 });
 
-// Flatten nested lead API response { core: {...}, local_fields: {...} } into
-// a flat object the popup can use (e.g. lead.first_name, lead.company_name).
-// If the lead is already flat (e.g. from CREATE_LEAD), return it unchanged.
+// Flatten a lead-like response into the shape the popup uses
+// (first_name, last_name, customer_number, company_name, ...).
+//
+// Accepts three shapes — the popup is source-agnostic, so we normalise here:
+//   1. Nested Unified Lead DTO: { core: {...}, local_fields: {...} } — from
+//      POST /api/leads/ and GET /api/leads/phone/.
+//   2. Flat entity hit from /api/crm/entities/search: { entity_id, entity_type,
+//      source_type, first_name, last_name, email, phone, company, ... }.
+//   3. Already flat (e.g. an object produced by a prior flattenLead call).
 function flattenLead(raw) {
-  if (!raw || !raw.core) return raw; // already flat or null
-  const c = raw.core || {};
-  const lf = raw.local_fields || {};
-  return {
-    lead_id: c.id || lf.lead_id,
-    first_name: c.first_name || null,
-    last_name: c.last_name || null,
-    email: c.email || null,
-    customer_number: lf.customer_number || c.phone || null,
-    company_name: c.company || lf.company_name || null,
-    job_title: lf.job_title || null,
-    source: lf.source || c.source_type || null,
-    status: c.status || null,
-    tags: c.tags || [],
-    notes: c.notes || null,
-    created_at: c.created_at || null,
-  };
+  if (!raw) return raw;
+
+  // Unified entity shape from /crm/entities/search
+  if (raw.entity_id && raw.entity_type) {
+    const idParts = String(raw.entity_id).split(':');
+    const rawId = idParts.length > 1 ? idParts.slice(1).join(':') : raw.entity_id;
+    return {
+      lead_id: rawId,
+      entity_id: raw.entity_id,
+      entity_type: raw.entity_type,
+      source: raw.source_type || null,
+      first_name: raw.first_name || null,
+      last_name: raw.last_name || null,
+      email: raw.email || null,
+      customer_number: raw.phone || null,
+      company_name: raw.company || null,
+      job_title: null,
+      status: null,
+      tags: [],
+      notes: null,
+      created_at: null,
+    };
+  }
+
+  // Unified Lead DTO { core, local_fields, salesforce_fields }
+  if (raw.core) {
+    const c = raw.core || {};
+    const lf = raw.local_fields || {};
+    return {
+      lead_id: c.id || lf.lead_id,
+      first_name: c.first_name || null,
+      last_name: c.last_name || null,
+      email: c.email || null,
+      customer_number: lf.customer_number || c.phone || null,
+      company_name: c.company || lf.company_name || null,
+      job_title: lf.job_title || null,
+      source: lf.source || c.source_type || null,
+      status: c.status || null,
+      tags: c.tags || [],
+      notes: c.notes || null,
+      created_at: c.created_at || null,
+    };
+  }
+
+  return raw; // already flat
 }
 
 const messageHandlers = {
@@ -1035,16 +1069,16 @@ const messageHandlers = {
     sendResponse({ success: true });
   },
 
-  // Leads — uses general search endpoint (partial match on phone/name/email/company)
-  // API returns nested { core: {...}, local_fields: {...} } — flatten for popup consumption.
+  // Unified CRM entity search (/api/crm/entities/search). Returns
+  // { entities: [{ entity_id, entity_type, source_type, first_name, ... }] }.
+  // flattenLead handles the shape; the popup stays source-agnostic.
   [MSG.SEARCH_LEADS]: async (msg, sender, sendResponse) => {
     const query = msg.data.query || msg.data.phoneNumber || '';
     log.info('Searching leads:', query);
     try {
       const result = await apiClient.searchLeads(query);
-      // The general endpoint returns { leads: [...], total_count, last_key }
-      const rawLeads = result?.leads || [];
-      const leads = rawLeads.map(flattenLead);
+      const rawEntities = result?.entities || result?.leads || [];
+      const leads = rawEntities.map(flattenLead);
       log.info('Lead search result:', { count: leads.length });
       if (leads.length === 1) {
         // Single match — auto-select
