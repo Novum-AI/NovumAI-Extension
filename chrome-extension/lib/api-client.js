@@ -12,7 +12,7 @@ class ApiClient {
     // No-op now since we always resolve fresh, but kept for API compatibility
   }
 
-  async _request(method, path, body = null) {
+  async _request(method, path, body = null, extraHeaders = {}) {
     const baseUrl = await this._getBaseUrl();
     const url = `${baseUrl}${path}`;
 
@@ -22,6 +22,7 @@ class ApiClient {
       headers: {
         'Content-Type': 'application/json',
         'X-Requested-With': 'NovumAI-Extension',
+        ...extraHeaders,
       },
     };
 
@@ -65,14 +66,31 @@ class ApiClient {
     return this.post(CONFIG.ASSEMBLYAI_TOKEN_ENDPOINT, {});
   }
 
+  // WebSocket token
+  async getWebSocketToken() {
+    return this.post(CONFIG.WEBSOCKET_TOKEN_ENDPOINT, {});
+  }
+
+  // CRM entity resolution
+  async resolveEntityByPhone(phoneNumber) {
+    const path = CONFIG.CRM_ENTITY_PHONE_ENDPOINT.replace('{phoneNumber}', encodeURIComponent(phoneNumber));
+    return this.get(path);
+  }
+
   // Calls
   async createCall(data) {
-    return this.post(CONFIG.CALLS_ENDPOINT, data);
+    const idempotencyKey = crypto.randomUUID();
+    return this._request('POST', CONFIG.CALLS_ENDPOINT, data, {
+      'Idempotency-Key': idempotencyKey,
+    });
   }
 
   async endCall(callConnectionId, data) {
     const path = CONFIG.CALLS_END_ENDPOINT.replace('{callConnectionId}', callConnectionId);
-    return this.post(path, data);
+    const idempotencyKey = `${callConnectionId}-end-${Date.now()}`;
+    return this._request('POST', path, data, {
+      'Idempotency-Key': idempotencyKey,
+    });
   }
 
   // Leads
