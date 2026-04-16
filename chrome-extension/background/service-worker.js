@@ -645,6 +645,7 @@ async function endSession() {
     ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim() || null
     : null;
   const endCallEntityId = sessionState.entityId || null;
+  const endCallTime = new Date().toISOString();
 
   // Clear activeSession BEFORE closing backend WS to prevent reconnect race
   sessionState.activeSession = null;
@@ -663,6 +664,7 @@ async function endSession() {
     await apiClient.endCall(callConnectionId, {
       status: 'ended',
       messageType: 'CALL_ENDED',
+      endTime: endCallTime,
       leadId: endCallLeadId,
       leadName: endCallLeadName,
       entityId: endCallEntityId,
