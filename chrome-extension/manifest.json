@@ -8,15 +8,14 @@
     "offscreen",
     "activeTab",
     "storage",
-    "cookies",
-    "tabs"
+    "alarms"
   ],
   "host_permissions": [
     "https://*.novumai.co/*",
     "https://streaming.assemblyai.com/*",
-    "https://*.execute-api.us-west-2.amazonaws.com/*",
     "https://meet.google.com/*"
   ],
+  "minimum_chrome_version": "116",
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"
@@ -47,12 +46,9 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "offscreen/offscreen.html",
-        "offscreen/pcm-processor-tab.js",
-        "offscreen/pcm-processor-mic.js",
-        "assets/*"
+        "offscreen/pcm-processor-mic.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": ["https://meet.google.com/*"]
     }
   ]
 }

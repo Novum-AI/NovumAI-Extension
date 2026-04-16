@@ -1,7 +1,7 @@
 // NovumAI Extension - Background Service Worker
 // Coordinates: auth, tab capture, WebSocket connections, message passing
 
-import { CONFIG, getApiBaseUrl, getWsUrl, getEnvironment } from '../lib/config.js';
+import { CONFIG, getWsUrl, getEnvironment } from '../lib/config.js';
 import { MSG } from '../lib/messages.js';
 import { apiClient } from '../lib/api-client.js';
 import { debug } from '../lib/debug.js';
@@ -9,6 +9,8 @@ import { debug } from '../lib/debug.js';
 const log = debug('SW');
 
 // ─── State ───────────────────────────────────────────────────────────────────
+// sessionState lives in SW module globals AND is mirrored to chrome.storage.session
+// so we can rehydrate after SW suspension.
 
 let sessionState = {
   isAuthenticated: false,
@@ -20,48 +22,88 @@ let sessionState = {
   contentMode: 'bullets',
   suggestionsEnabled: true,
   sequenceNumber: 0,
-  elapsedSeconds: 0,
-  lead: null, // { lead_id, first_name, last_name, company_name, customer_number, ... }
-  entityId: null, // Captured from createCall response (unified CRM entity)
-  callDirection: 'outbound', // Extension calls are always outbound
+  lead: null,
+  entityId: null,
+  callDirection: 'outbound',
 };
 
 let backendWs = null;
 let assemblyAiCustomerWs = null;
 let assemblyAiAgentWs = null;
-let elapsedTimer = null;
-let retryPollTimer = null;
 let retryQueue = [];
 let offscreenCreated = false;
+let offscreenCreatePromise = null;
+let stateHydrated = false;
+
+// ─── Persistence (chrome.storage.session survives SW suspension) ─────────────
+// Only active-call state is persisted — user/company re-fetched from backend.
+
+const PERSISTED_KEYS = [
+  'activeSession',
+  'currentStage',
+  'businessMode',
+  'contentMode',
+  'suggestionsEnabled',
+  'sequenceNumber',
+  'lead',
+  'entityId',
+  'callDirection',
+];
+
+async function persistState() {
+  if (!chrome.storage?.session) return;
+  const snapshot = {};
+  for (const k of PERSISTED_KEYS) snapshot[k] = sessionState[k];
+  try {
+    await chrome.storage.session.set({ novumai_session: snapshot });
+  } catch (e) {
+    log.warn('persistState failed:', e.message);
+  }
+}
+
+async function hydrateState() {
+  if (stateHydrated) return;
+  stateHydrated = true;
+  if (!chrome.storage?.session) return;
+  try {
+    const { novumai_session } = await chrome.storage.session.get('novumai_session');
+    if (novumai_session) {
+      for (const k of PERSISTED_KEYS) {
+        if (novumai_session[k] !== undefined) sessionState[k] = novumai_session[k];
+      }
+      if (sessionState.activeSession) {
+        log.info('Rehydrated active session from storage.session', {
+          callConnectionId: sessionState.activeSession.callConnectionId,
+        });
+      }
+    }
+  } catch (e) {
+    log.warn('hydrateState failed:', e.message);
+  }
+}
+
+function elapsedFromStartTime() {
+  const s = sessionState.activeSession;
+  if (!s?.startTime) return 0;
+  return Math.max(0, Math.floor((Date.now() - s.startTime) / 1000));
+}
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 async function checkAuth() {
+  // Cookie-based auth: fetch /api/users/me with credentials: include. A 401 from the
+  // API is the authoritative signal — we no longer need chrome.cookies to probe first.
   try {
-    log.info('Checking auth...');
-    const cookie = await apiClient.getSessionCookie();
-    if (!cookie) {
-      log.info('No session cookie found');
-      sessionState.isAuthenticated = false;
-      sessionState.user = null;
-      sessionState.company = null;
-      return { authenticated: false };
-    }
-    log.info('Session cookie found, verifying with API...');
-
+    log.info('Checking auth via /api/users/me');
     const [meResult, companyResult] = await Promise.allSettled([
       apiClient.getMe(),
       apiClient.getCompany(),
     ]);
 
-    // /api/users/me returns user object directly (with user_id field)
     if (meResult.status === 'fulfilled' && meResult.value?.user_id) {
       sessionState.isAuthenticated = true;
       sessionState.user = meResult.value;
-
-      if (companyResult.status === 'fulfilled') {
-        sessionState.company = companyResult.value;
-      }
+      sessionState.company = companyResult.status === 'fulfilled' ? companyResult.value : null;
 
       log.info('Auth verified', { userId: meResult.value.user_id, email: meResult.value.email });
       return {
@@ -71,13 +113,13 @@ async function checkAuth() {
       };
     }
 
-    log.warn('Auth API call failed or no user_id', { meResult: meResult.status, meValue: meResult.value });
+    log.warn('Not authenticated', { meStatus: meResult.status });
     sessionState.isAuthenticated = false;
     sessionState.user = null;
     sessionState.company = null;
     return { authenticated: false };
   } catch (e) {
-    log.error('Auth check failed:', e);
+    log.error('Auth check failed:', e.message);
     sessionState.isAuthenticated = false;
     sessionState.user = null;
     sessionState.company = null;
@@ -89,24 +131,39 @@ async function checkAuth() {
 
 async function ensureOffscreenDocument() {
   if (offscreenCreated) return;
+  // De-dupe concurrent callers so two startSession calls don't both try to create
+  if (offscreenCreatePromise) return offscreenCreatePromise;
 
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [chrome.runtime.getURL('offscreen/offscreen.html')],
-  });
+  offscreenCreatePromise = (async () => {
+    const existingContexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL('offscreen/offscreen.html')],
+    });
 
-  if (existingContexts.length > 0) {
+    if (existingContexts.length === 0) {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen/offscreen.html',
+        reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
+        justification: 'Audio processing for real-time transcription',
+      });
+    }
+
     offscreenCreated = true;
-    return;
-  }
-
-  await chrome.offscreen.createDocument({
-    url: 'offscreen/offscreen.html',
-    reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
-    justification: 'Audio processing for real-time transcription',
+  })().finally(() => {
+    offscreenCreatePromise = null;
   });
 
-  offscreenCreated = true;
+  return offscreenCreatePromise;
+}
+
+async function closeOffscreenDocument() {
+  if (!offscreenCreated) return;
+  try {
+    await chrome.offscreen.closeDocument();
+  } catch (e) {
+    log.warn('closeOffscreenDocument failed:', e.message);
+  }
+  offscreenCreated = false;
 }
 
 // ─── Tab Capture ─────────────────────────────────────────────────────────────
@@ -277,68 +334,92 @@ async function fetchWsToken() {
 
 // ─── NovumAI Backend WebSocket ──────────────────────────────────────────────
 
+let backendReconnectAttempts = 0;
+let backendReconnectTimeoutId = null;
+const BACKEND_RECONNECT_MAX_ATTEMPTS = 6;
+
+function clearBackendReconnect() {
+  if (backendReconnectTimeoutId !== null) {
+    clearTimeout(backendReconnectTimeoutId);
+    backendReconnectTimeoutId = null;
+  }
+}
+
 async function connectBackendWs() {
   const wsUrl = await getWsUrl();
   const agentId = sessionState.user?.user_id;
   if (!agentId) throw new Error('No user ID for WebSocket connection');
 
-  // Fetch a fresh HMAC token and encode as subprotocol
   const wsToken = await fetchWsToken();
   const subprotocol = encodeWsSubprotocolToken(wsToken);
 
-  backendWs = new WebSocket(wsUrl, [subprotocol]);
+  const ws = new WebSocket(wsUrl, [subprotocol]);
+  backendWs = ws;
 
-  // Wait for backend WS to actually open
+  // Handshake — use once-listeners so later errors don't resolve this promise.
   await new Promise((resolve, reject) => {
-    backendWs.onopen = () => {
-      console.log('[NovumAI] Backend WebSocket connected (token auth)');
+    const onOpen = () => {
+      ws.removeEventListener('error', onError);
+      log.info('Backend WebSocket connected');
+      backendReconnectAttempts = 0;
       flushRetryQueue();
-      broadcastToContent({
-        type: MSG.CONNECTION_STATUS,
-        data: { connected: true },
-      });
+      broadcastToContent({ type: MSG.CONNECTION_STATUS, data: { connected: true } });
       resolve();
     };
-    backendWs.onerror = (e) => {
-      console.error('[NovumAI] Backend WS connection error:', e);
+    const onError = () => {
+      ws.removeEventListener('open', onOpen);
       reject(new Error('Backend WebSocket failed to connect'));
     };
+    ws.addEventListener('open', onOpen, { once: true });
+    ws.addEventListener('error', onError, { once: true });
   });
 
-  // Set up ongoing handlers after connection
-  backendWs.onmessage = (event) => {
+  ws.addEventListener('message', (event) => {
     try {
       const msg = JSON.parse(event.data);
-
-      // Capture connectionId from initial message
       if (msg.connectionId && sessionState.activeSession) {
         sessionState.activeSession.wsConnectionId = msg.connectionId;
-        console.log('[NovumAI] Backend WS connectionId:', msg.connectionId);
+        persistState();
       }
-
       handleBackendMessage(msg);
     } catch (e) {
-      console.error('[NovumAI] Backend WS parse error:', e);
+      log.error('Backend WS parse error:', e.message);
     }
-  };
+  });
 
-  backendWs.onerror = (e) => {
-    console.error('[NovumAI] Backend WS error:', e);
-  };
+  ws.addEventListener('error', (e) => {
+    log.error('Backend WS error', e?.message || '');
+  });
 
-  backendWs.onclose = (e) => {
-    console.log(`[NovumAI] Backend WS closed: ${e.code}`);
-    backendWs = null;
+  ws.addEventListener('close', (e) => {
+    log.info(`Backend WS closed: ${e.code}`);
+    if (backendWs === ws) backendWs = null;
 
-    // Auto-reconnect if session is active (fetches a fresh token)
-    if (sessionState.activeSession) {
+    if (!sessionState.activeSession) return;
+
+    if (backendReconnectAttempts >= BACKEND_RECONNECT_MAX_ATTEMPTS) {
+      log.error('Backend WS reconnect attempts exhausted; ending session');
       broadcastToContent({
         type: MSG.CONNECTION_STATUS,
-        data: { connected: false, code: e.code, reconnecting: true },
+        data: { connected: false, code: e.code, reconnecting: false, exhausted: true },
       });
-      setTimeout(() => connectBackendWs(), 3000);
+      return;
     }
-  };
+
+    backendReconnectAttempts += 1;
+    const delay = Math.min(3000 * 2 ** (backendReconnectAttempts - 1), 30000);
+    broadcastToContent({
+      type: MSG.CONNECTION_STATUS,
+      data: { connected: false, code: e.code, reconnecting: true, attempt: backendReconnectAttempts },
+    });
+
+    clearBackendReconnect();
+    backendReconnectTimeoutId = setTimeout(() => {
+      backendReconnectTimeoutId = null;
+      if (!sessionState.activeSession) return;
+      connectBackendWs().catch((err) => log.error('Backend reconnect failed:', err.message));
+    }, delay);
+  });
 }
 
 function handleBackendMessage(msg) {
@@ -358,6 +439,7 @@ function handleBackendMessage(msg) {
 
     if (msg.current_stage && msg.current_stage !== sessionState.currentStage) {
       sessionState.currentStage = msg.current_stage;
+      persistState();
       broadcastToContent({
         type: MSG.STAGE_UPDATE,
         data: { stage: msg.current_stage },
@@ -388,6 +470,7 @@ function handleBackendMessage(msg) {
 
     if (msg.next_stage) {
       sessionState.currentStage = msg.next_stage;
+      persistState();
     }
   } else if (type === 'SMART_SUGGESTIONS_LIMIT_REACHED') {
     broadcastToContent({
@@ -417,6 +500,7 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
   if (!sessionState.activeSession) return;
 
   sessionState.sequenceNumber++;
+  persistState();
   const messageId = crypto.randomUUID();
 
   const payload = {
@@ -442,7 +526,7 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
     companyName: sessionState.company?.name || '',
     suggestionsEnabled: sessionState.suggestionsEnabled,
     plan: sessionState.company?.plan || {},
-    activeSessionSeconds: sessionState.elapsedSeconds,
+    activeSessionSeconds: elapsedFromStartTime(),
     sequence_number: sessionState.sequenceNumber,
   };
 
@@ -452,7 +536,7 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
     try {
       backendWs.send(JSON.stringify(message));
     } catch (e) {
-      console.error('[NovumAI] Failed to send transcript:', e);
+      log.error('Failed to send transcript:', e.message);
       queueForRetry(payload);
     }
   } else {
@@ -461,26 +545,32 @@ function sendTranscriptToBackend(text, speaker, audioStart, audioEnd) {
 }
 
 function queueForRetry(payload) {
-  if (retryQueue.length < 100) {
-    retryQueue.push({ payload, retries: 0, timestamp: Date.now() });
-  }
+  // Evict oldest (shift) rather than drop newest so sequence numbers stay as
+  // contiguous as possible — the newest chunk is the one most likely to matter.
+  if (retryQueue.length >= 100) retryQueue.shift();
+  retryQueue.push({ payload, retries: 0, timestamp: Date.now() });
 }
 
 function flushRetryQueue() {
   if (!retryQueue.length || !backendWs || backendWs.readyState !== WebSocket.OPEN) return;
 
-  const items = [...retryQueue];
+  const items = retryQueue;
   retryQueue = [];
+  let dropped = 0;
 
   for (const item of items) {
-    if (item.retries < CONFIG.MAX_RETRIES) {
-      try {
-        backendWs.send(JSON.stringify({ type: 'ingest_transcript', payload: item.payload }));
-      } catch {
-        retryQueue.push({ ...item, retries: item.retries + 1 });
-      }
+    if (item.retries >= CONFIG.MAX_RETRIES) {
+      dropped += 1;
+      continue;
+    }
+    try {
+      backendWs.send(JSON.stringify({ type: 'ingest_transcript', payload: item.payload }));
+    } catch {
+      retryQueue.push({ ...item, retries: item.retries + 1 });
     }
   }
+
+  if (dropped > 0) log.warn(`Dropped ${dropped} transcript chunk(s) after MAX_RETRIES`);
 }
 
 // ─── Session Lifecycle ──────────────────────────────────────────────────────
@@ -500,47 +590,44 @@ async function startSession(tabId) {
   const callConnectionId = `ext-${crypto.randomUUID()}`;
   log.info('Call connection ID:', callConnectionId);
 
-  // Reset state
+  // Reset per-session counters
   sessionState.sequenceNumber = 0;
-  sessionState.elapsedSeconds = 0;
   sessionState.currentStage = 'CALL_OPENING';
 
-  // Track what we've started so we can roll back on failure
+  // Set activeSession BEFORE connecting so reconnect + broadcast see the tabId
+  sessionState.activeSession = {
+    callConnectionId,
+    startTime: Date.now(),
+    tabId,
+    wsConnectionId: '',
+  };
+  await persistState();
+
   let backendWsStarted = false;
   let tabCaptureStarted = false;
   let customerWsStarted = false;
   let agentWsStarted = false;
 
   try {
-    // 1. Connect backend WebSocket
     log.info('Step 1/3: Connecting backend WebSocket...');
     await connectBackendWs();
     backendWsStarted = true;
-    log.info('Step 1/3: ✓ Backend WS connected');
 
-    // 2. Start tab capture → offscreen audio processing
-    log.info('Step 2/3: Starting tab capture...');
-    await startTabCapture(tabId);
-    tabCaptureStarted = true;
-    log.info('Step 2/3: ✓ Tab capture started');
-
-    // 2b. Start mic capture in content script (non-blocking — mic failure is non-fatal)
-    log.info('Step 2b: Starting mic capture in content script...');
-    broadcastToContent({ type: MSG.START_MIC_CAPTURE });
-    log.info('Step 2b: Mic capture request sent to content script');
-
-    // 3. Connect AssemblyAI for both streams
-    log.info('Step 3/3: Connecting AssemblyAI...');
+    // Connect AssemblyAI BEFORE starting capture so audio has a target from sample 0.
+    log.info('Step 2/3: Connecting AssemblyAI...');
     assemblyAiCustomerWs = await connectAssemblyAI('customer');
     customerWsStarted = true;
-    log.info('Step 3/3: ✓ AssemblyAI customer connected');
     assemblyAiAgentWs = await connectAssemblyAI('agent');
     agentWsStarted = true;
-    log.info('Step 3/3: ✓ AssemblyAI agent connected');
+
+    log.info('Step 3/3: Starting tab capture...');
+    await startTabCapture(tabId);
+    tabCaptureStarted = true;
+
+    // Mic capture in content script is non-fatal — session continues if user denies.
+    broadcastToContent({ type: MSG.START_MIC_CAPTURE });
   } catch (e) {
-    // Roll back any resources that were started
     log.error('Session startup failed, rolling back:', e.message);
-    log.info('Rollback state:', { backendWsStarted, tabCaptureStarted, customerWsStarted, agentWsStarted });
 
     if (agentWsStarted && assemblyAiAgentWs) {
       assemblyAiAgentWs.close();
@@ -550,18 +637,19 @@ async function startSession(tabId) {
       assemblyAiCustomerWs.close();
       assemblyAiCustomerWs = null;
     }
-    // Always send stop to offscreen to release any held streams/contexts
-    // This prevents "Cannot capture a tab with an active stream" on retry
     stopTabCapture();
+    clearBackendReconnect();
     if (backendWsStarted && backendWs) {
       backendWs.close();
       backendWs = null;
     }
 
+    sessionState.activeSession = null;
+    await persistState();
     throw e;
   }
 
-  // 4. Create call record on backend (non-blocking)
+  // Create call record on backend (non-blocking)
   try {
     const callResponse = await apiClient.createCall({
       callConnectionId,
@@ -570,37 +658,18 @@ async function startSession(tabId) {
       leadId: sessionState.lead?.lead_id || null,
       startTime: new Date().toISOString(),
     });
-    // Capture entityId from backend response for transcript payloads and endCall
     if (callResponse?.entityId) {
       sessionState.entityId = callResponse.entityId;
+      await persistState();
     }
   } catch (e) {
-    console.warn('[NovumAI] Call creation failed (non-blocking):', e);
+    log.warn('Call creation failed (non-blocking):', e.message);
   }
 
-  // 5. Start elapsed timer
-  elapsedTimer = setInterval(() => {
-    sessionState.elapsedSeconds++;
-    broadcastToContent({
-      type: MSG.SESSION_STATE,
-      data: { elapsedSeconds: sessionState.elapsedSeconds },
-    });
-  }, 1000);
-
-  sessionState.activeSession = {
-    callConnectionId,
-    startTime: Date.now(),
-    tabId,
-    wsConnectionId: '',
-  };
-
-  // 6. Retry queue polling (store ref so we can clear it on session end)
-  if (retryPollTimer) clearInterval(retryPollTimer);
-  retryPollTimer = setInterval(() => {
-    if (retryQueue.length > 0 && backendWs?.readyState === WebSocket.OPEN) {
-      flushRetryQueue();
-    }
-  }, CONFIG.RETRY_POLL_INTERVAL_MS);
+  // Alarm drives periodic elapsed broadcasts + retry flush.
+  // chrome.alarms minimum period is 30s in prod, but content script keeps its own
+  // local 1s timer from activeSession.startTime for smooth countdown display.
+  chrome.alarms.create('session-tick', { periodInMinutes: 0.5 });
 
   return { callConnectionId };
 }
@@ -608,19 +677,16 @@ async function startSession(tabId) {
 async function endSession() {
   if (!sessionState.activeSession) return;
 
-  const { callConnectionId } = sessionState.activeSession;
+  const { callConnectionId, startTime, tabId } = sessionState.activeSession;
+  const durationSeconds = elapsedFromStartTime();
 
-  // Stop timer
-  if (elapsedTimer) {
-    clearInterval(elapsedTimer);
-    elapsedTimer = null;
-  }
+  // Kill the session-tick alarm first so it can't restart anything mid-teardown
+  chrome.alarms.clear('session-tick').catch(() => {});
 
   // Stop audio capture
   stopTabCapture();
   broadcastToContent({ type: MSG.STOP_MIC_CAPTURE });
 
-  // Close AssemblyAI connections
   if (assemblyAiCustomerWs) {
     assemblyAiCustomerWs.close();
     assemblyAiCustomerWs = null;
@@ -630,16 +696,14 @@ async function endSession() {
     assemblyAiAgentWs = null;
   }
 
-  // Build session summary BEFORE clearing activeSession
   const summary = {
     callConnectionId,
-    startTime: sessionState.activeSession.startTime,
+    startTime,
     endTime: Date.now(),
-    durationSeconds: sessionState.elapsedSeconds,
+    durationSeconds,
     stagesReached: sessionState.currentStage,
   };
 
-  // Capture values needed for endCall before clearing state
   const endCallLeadId = sessionState.lead?.lead_id || null;
   const endCallLeadName = sessionState.lead
     ? `${sessionState.lead.first_name || ''} ${sessionState.lead.last_name || ''}`.trim() || null
@@ -652,14 +716,10 @@ async function endSession() {
   sessionState.sequenceNumber = 0;
   sessionState.entityId = null;
   retryQueue = [];
+  await persistState();
 
-  // Clear retry poll timer
-  if (retryPollTimer) {
-    clearInterval(retryPollTimer);
-    retryPollTimer = null;
-  }
+  clearBackendReconnect();
 
-  // End call on backend
   try {
     await apiClient.endCall(callConnectionId, {
       status: 'ended',
@@ -670,47 +730,58 @@ async function endSession() {
       entityId: endCallEntityId,
     });
   } catch (e) {
-    console.warn('[NovumAI] Call end API failed:', e);
+    log.warn('Call end API failed:', e.message);
   }
 
-  // Close backend WebSocket (activeSession is already null so onclose won't reconnect)
   if (backendWs) {
     backendWs.close();
     backendWs = null;
   }
 
+  await closeOffscreenDocument();
+
   await chrome.storage.local.set({ lastSession: summary });
 
-  // Open post-call analytics on the webapp
   const env = await getEnvironment();
   const webappBase = env === 'production' ? CONFIG.WEBAPP_URL_PROD : CONFIG.WEBAPP_URL_DEV;
   const analyticsUrl = `${webappBase}/call-analytics/${callConnectionId}`;
-  chrome.tabs.create({ url: analyticsUrl });
+  chrome.tabs.create({ url: analyticsUrl, active: false });
 
-  broadcastToContent({ type: MSG.SESSION_ENDED, data: summary });
+  // Target the actual session tab — not a broad query.
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { type: MSG.SESSION_ENDED, data: summary }).catch(() => {});
+  }
 
   return summary;
 }
 
 // ─── Content Script Communication ───────────────────────────────────────────
+// Prefer the stored session tabId when we have an active session. Fall back to a
+// Meet-URL query only when there is no active session (rare — state-independent
+// broadcasts like CONNECTION_STATUS during a reconnect attempt before start).
 
 function broadcastToContent(message, retries = 0) {
+  const sessionTabId = sessionState.activeSession?.tabId;
+  if (sessionTabId) {
+    chrome.tabs.sendMessage(sessionTabId, message).catch((err) => {
+      const isCritical = message.type === MSG.SESSION_STARTED || message.type === MSG.SESSION_ENDED;
+      if (isCritical && retries < 3) {
+        setTimeout(() => broadcastToContent(message, retries + 1), 500);
+      } else {
+        log.warn(`Broadcast to tab ${sessionTabId} failed:`, err.message);
+      }
+    });
+    return;
+  }
+
+  // No session → fall back to URL query (only for pre-session broadcasts)
   chrome.tabs.query({ url: 'https://meet.google.com/*' }, (tabs) => {
-    if (tabs.length === 0 && retries < 3) {
-      // Content script tab not found yet, retry after a short delay
+    if (tabs.length === 0 && retries < 3 && message.type === MSG.SESSION_STARTED) {
       setTimeout(() => broadcastToContent(message, retries + 1), 500);
       return;
     }
     for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, message).catch((err) => {
-        // Content script may not be ready yet — retry once for critical messages
-        if (retries < 2 && (message.type === MSG.SESSION_STARTED || message.type === MSG.SESSION_ENDED)) {
-          console.warn(`[NovumAI] Broadcast to tab ${tab.id} failed, retrying:`, err.message);
-          setTimeout(() => {
-            chrome.tabs.sendMessage(tab.id, message).catch(() => {});
-          }, 1000);
-        }
-      });
+      chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
   });
 }
@@ -742,16 +813,20 @@ function handleAudioChunk(streamType, audioData) {
 // ─── Message Listener ───────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Ignore messages not for background
+  // Reject messages from anywhere other than this extension. Web pages cannot
+  // reach this listener without externally_connectable (not declared), but defense
+  // in depth — this guards future additions.
+  if (sender.id !== chrome.runtime.id) return false;
+
+  // Ignore messages not addressed to background
   if (message.target && message.target !== 'background') return false;
 
   const handler = messageHandlers[message.type];
-  if (handler) {
-    handler(message, sender, sendResponse);
-    return true; // Async response
-  }
+  if (!handler) return false;
 
-  return false;
+  // Ensure state is rehydrated before handling (SW may have just woken up)
+  hydrateState().then(() => handler(message, sender, sendResponse));
+  return true; // async response
 });
 
 // Flatten nested lead API response { core: {...}, local_fields: {...} } into
@@ -822,7 +897,7 @@ const messageHandlers = {
       company: sessionState.company,
       hasActiveSession: !!sessionState.activeSession,
       activeSession: sessionState.activeSession,
-      elapsedSeconds: sessionState.elapsedSeconds,
+      elapsedSeconds: elapsedFromStartTime(),
       currentStage: sessionState.currentStage,
       businessMode: sessionState.businessMode,
       contentMode: sessionState.contentMode,
@@ -845,16 +920,19 @@ const messageHandlers = {
 
   [MSG.SET_BUSINESS_MODE]: (msg, sender, sendResponse) => {
     sessionState.businessMode = msg.data?.businessMode || 'sales';
+    persistState();
     sendResponse({ success: true });
   },
 
   [MSG.SET_CONTENT_MODE]: (msg, sender, sendResponse) => {
     sessionState.contentMode = msg.data?.contentMode || 'bullets';
+    persistState();
     sendResponse({ success: true });
   },
 
   [MSG.SET_SUGGESTIONS_ENABLED]: (msg, sender, sendResponse) => {
     sessionState.suggestionsEnabled = msg.data?.enabled ?? true;
+    persistState();
     sendResponse({ success: true });
   },
 
@@ -909,6 +987,7 @@ const messageHandlers = {
 
   [MSG.SET_LEAD]: (msg, sender, sendResponse) => {
     sessionState.lead = msg.data?.lead || null;
+    persistState();
     log.info('Lead set:', sessionState.lead ? { leadId: sessionState.lead.lead_id, phone: sessionState.lead.customer_number } : 'cleared');
     sendResponse({ success: true });
   },
@@ -925,10 +1004,37 @@ const messageHandlers = {
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(async () => {
-  console.log('[NovumAI] Extension installed');
+  log.always('Extension installed');
+  // Clear any stale session storage from a previous install
+  try { await chrome.storage.session.clear(); } catch {}
 });
 
-// Check auth on startup
-checkAuth().then((result) => {
-  console.log('[NovumAI] Initial auth check:', result.authenticated ? 'authenticated' : 'not authenticated');
+chrome.runtime.onStartup.addListener(() => {
+  log.info('Browser startup — clearing stale session state');
+  chrome.storage.session.clear().catch(() => {});
+});
+
+// Rehydrate on any SW wake — top-level code runs on every start.
+hydrateState().catch((e) => log.warn('Initial hydrate failed:', e.message));
+
+// Alarm handler — fires every 30s while a session is active. Drives retry flush
+// and keeps the SW warm. Must be registered at top level so it survives SW restarts.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'session-tick') return;
+  await hydrateState();
+  if (!sessionState.activeSession) {
+    chrome.alarms.clear('session-tick').catch(() => {});
+    return;
+  }
+  flushRetryQueue();
+  // Ping backend WS as a keep-alive (backend ignores unknown types gracefully)
+  if (backendWs?.readyState === WebSocket.OPEN) {
+    try { backendWs.send(JSON.stringify({ type: 'ping' })); } catch {}
+  }
+});
+
+// Best-effort graceful persist on suspend
+chrome.runtime.onSuspend.addListener(() => {
+  // onSuspend must be synchronous — fire-and-forget the persist
+  persistState();
 });

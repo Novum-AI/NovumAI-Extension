@@ -109,33 +109,6 @@ class ApiClient {
   async createLead(data) {
     return this.post(CONFIG.LEADS_CREATE_ENDPOINT, data);
   }
-
-  // Session cookie check
-  async getSessionCookie() {
-    try {
-      const cookie = await chrome.cookies.get({
-        url: await this._getBaseUrl(),
-        name: CONFIG.SESSION_COOKIE_NAME,
-      });
-      return cookie?.value || null;
-    } catch (e) {
-      console.warn('[NovumAI] Could not read session cookie:', e);
-      return null;
-    }
-  }
-
-  async isAuthenticated() {
-    const cookie = await this.getSessionCookie();
-    if (!cookie) return false;
-
-    try {
-      const me = await this.getMe();
-      // /api/users/me returns user object directly with user_id field
-      return !!me?.user_id;
-    } catch {
-      return false;
-    }
-  }
 }
 
 export const apiClient = new ApiClient();
