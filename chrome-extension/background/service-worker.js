@@ -19,7 +19,7 @@ let sessionState = {
   activeSession: null, // { callConnectionId, startTime, tabId, wsConnectionId }
   currentStage: 'CALL_OPENING',
   businessMode: 'sales',
-  contentMode: 'bullets',
+  contentMode: 'notes', // Matches frontend default (TranscriptContext) and backend default (realtime_sentiment_analysis)
   suggestionsEnabled: true,
   sequenceNumber: 0,
   lead: null,
@@ -649,21 +649,30 @@ async function startSession(tabId) {
     throw e;
   }
 
-  // Create call record on backend (non-blocking)
-  try {
-    const callResponse = await apiClient.createCall({
-      callConnectionId,
-      direction: 'outbound',
-      customerNumber: sessionState.lead?.customer_number || null,
-      leadId: sessionState.lead?.lead_id || null,
-      startTime: new Date().toISOString(),
-    });
-    if (callResponse?.entityId) {
-      sessionState.entityId = callResponse.entityId;
-      await persistState();
+  // Create call record on backend (non-blocking).
+  // Skip when no lead is attached — backend call_service.create_call() unconditionally
+  // indexes call_data["customer_number"] which the router strips when null, causing a
+  // 500. Transcripts still flow over the WS; record can be created later via endCall
+  // (which accepts leadId retroactively).
+  const customerNumber = sessionState.lead?.customer_number || null;
+  if (customerNumber) {
+    try {
+      const callResponse = await apiClient.createCall({
+        callConnectionId,
+        direction: 'outbound',
+        customerNumber,
+        leadId: sessionState.lead?.lead_id || null,
+        startTime: new Date().toISOString(),
+      });
+      if (callResponse?.entityId) {
+        sessionState.entityId = callResponse.entityId;
+        await persistState();
+      }
+    } catch (e) {
+      log.warn('Call creation failed (non-blocking):', e.message);
     }
-  } catch (e) {
-    log.warn('Call creation failed (non-blocking):', e.message);
+  } else {
+    log.info('Skipping createCall — no lead/customer_number attached');
   }
 
   // Alarm drives periodic elapsed broadcasts + retry flush.
@@ -759,6 +768,82 @@ async function endSession() {
 // Prefer the stored session tabId when we have an active session. Fall back to a
 // Meet-URL query only when there is no active session (rare — state-independent
 // broadcasts like CONNECTION_STATUS during a reconnect attempt before start).
+
+// Ping the tab to see if the content script is alive; if not, programmatically
+// inject it. Required because declarative content_scripts do NOT auto-inject into
+// tabs that were already open when the extension was (re)loaded — a common cause
+// of "Could not establish connection. Receiving end does not exist."
+async function ensureContentScriptLoaded(tabId) {
+  // Using log.always so diagnostics are visible without enabling novumai_debug.
+  // Can be demoted once stable.
+  let tabInfo = null;
+  try {
+    tabInfo = await chrome.tabs.get(tabId);
+  } catch (e) {
+    log.error(`ensureContentScriptLoaded: tab ${tabId} not found:`, e.message);
+    return false;
+  }
+  log.always(`ensureContentScriptLoaded: tab ${tabId} url=${tabInfo.url?.substring(0, 80)} status=${tabInfo.status}`);
+
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+    if (pong?.ready) {
+      log.always(`Content script already loaded in tab ${tabId}`);
+      return true;
+    }
+  } catch (e) {
+    log.always(`Pre-inject PING failed (${e.message}) — will inject`);
+  }
+
+  if (!chrome.scripting?.executeScript) {
+    log.error('chrome.scripting unavailable — check manifest "scripting" permission + remove & re-add extension');
+    return false;
+  }
+
+  try {
+    log.always(`Injecting content.js into tab ${tabId} (ISOLATED world, all frames)`);
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'ISOLATED',
+      files: ['content/content.js'],
+    });
+    log.always(`executeScript returned ${results?.length || 0} result(s):`, JSON.stringify(
+      results?.map((r) => ({
+        frameId: r.frameId,
+        documentId: r.documentId?.substring(0, 8),
+        hasResult: r.result !== undefined,
+        error: r.error?.message,
+      })) || [],
+    ));
+
+    try {
+      await chrome.scripting.insertCSS({
+        target: { tabId, allFrames: true },
+        files: ['content/overlay.css'],
+      });
+    } catch (e) {
+      log.warn(`insertCSS failed (non-fatal):`, e.message);
+    }
+
+    // Give the listener a tick to register before any broadcast.
+    await new Promise((r) => setTimeout(r, 300));
+
+    try {
+      const verify = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+      if (verify?.ready) {
+        log.always(`Post-inject PING succeeded for tab ${tabId}`);
+        return true;
+      }
+      log.warn(`Post-inject PING returned non-ready:`, JSON.stringify(verify));
+    } catch (e) {
+      log.warn(`Post-inject PING failed for tab ${tabId}:`, e.message);
+    }
+    return false;
+  } catch (e) {
+    log.error(`executeScript threw for tab ${tabId}:`, e.message, e.stack);
+    return false;
+  }
+}
 
 function broadcastToContent(message, retries = 0) {
   const sessionTabId = sessionState.activeSession?.tabId;
@@ -870,6 +955,10 @@ const messageHandlers = {
         log.info('Lead attached to session', { leadId: msg.data.lead.lead_id, phone: msg.data.lead.customer_number });
       }
 
+      // Inject content script if the Meet tab was already open when the extension
+      // was (re)loaded — declarative content_scripts don't retro-inject.
+      await ensureContentScriptLoaded(tabId);
+
       const result = await startSession(tabId);
       log.always('Session started successfully', result);
       sendResponse({ success: true, ...result });
@@ -925,7 +1014,7 @@ const messageHandlers = {
   },
 
   [MSG.SET_CONTENT_MODE]: (msg, sender, sendResponse) => {
-    sessionState.contentMode = msg.data?.contentMode || 'bullets';
+    sessionState.contentMode = msg.data?.contentMode || 'notes';
     persistState();
     sendResponse({ success: true });
   },

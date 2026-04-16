@@ -2,7 +2,14 @@
 // Creates and manages the floating overlay panel with inline SVG icons
 
 (() => {
-  if (document.getElementById('novumai-overlay')) return;
+  // A stale overlay div can survive an extension remove/reinstall because the
+  // content script's isolated world is torn down but the DOM it appended to the
+  // main world persists. If we early-return here the message listener below
+  // never registers, and every chrome.tabs.sendMessage from the SW fails with
+  // "Receiving end does not exist." Instead, tear down any stale overlay and
+  // re-initialise cleanly.
+  const staleOverlay = document.getElementById('novumai-overlay');
+  if (staleOverlay) staleOverlay.remove();
 
   // ─── Inline SVG Icons ────────────────────────────────────────────────────
   // We use inline SVGs instead of Font Awesome webfonts in the content script.
@@ -555,6 +562,10 @@
       console.log('[NovumAI:Content] Message received:', message.type, message.data ? Object.keys(message.data) : '');
     }
     switch (message.type) {
+      case 'PING':
+        // Readiness probe used by SW to decide whether to programmatically inject.
+        sendResponse({ ready: true });
+        return true;
       case 'SESSION_STARTED':
         console.log('[NovumAI:Content] ⚡ SESSION_STARTED — showing overlay');
         showOverlay();

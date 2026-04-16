@@ -37,7 +37,16 @@ class ApiClient {
       throw new Error(`API ${method} ${path} failed: ${response.status} - ${errorText}`);
     }
 
-    return response.json();
+    // 204 No Content or empty body → return null rather than throwing on JSON.parse('').
+    // e.g. /api/calls/{id}/end may return an empty success body in some deployments.
+    if (response.status === 204) return null;
+    const text = await response.text();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
   }
 
   async get(path) {
