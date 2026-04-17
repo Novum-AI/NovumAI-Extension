@@ -3,6 +3,9 @@ node_modules/
 AUDIT_SUMMARY.md
 icon-generator/
 
+.claude/*
+docs/professor/*
+
 .DS_Store
 *.log
 npm-debug.log*
