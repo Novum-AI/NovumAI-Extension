@@ -657,12 +657,15 @@ async function startSession(tabId) {
   const customerNumber = sessionState.lead?.customer_number || null;
   if (customerNumber) {
     try {
+      // Payload shape mirrors Novum-AI-Frontend/src/services/CallService.ts:createCall
+      // (snake_case everywhere except callConnectionId — matches backend DTO primary names).
+      const leadId = sessionState.lead?.lead_id || null;
       const callResponse = await apiClient.createCall({
         callConnectionId,
         direction: 'outbound',
-        customerNumber,
-        leadId: sessionState.lead?.lead_id || null,
-        startTime: new Date().toISOString(),
+        customer_number: customerNumber,
+        start_time: new Date().toISOString(),
+        ...(leadId && { lead_id: leadId }),
       });
       if (callResponse?.entityId) {
         sessionState.entityId = callResponse.entityId;
@@ -730,13 +733,15 @@ async function endSession() {
   clearBackendReconnect();
 
   try {
+    // Payload shape mirrors Novum-AI-Frontend/src/services/CallService.ts:endCall
+    // (snake_case for body fields; messageType/postCallFeedback/aiSessions stay camelCase).
     await apiClient.endCall(callConnectionId, {
       status: 'ended',
       messageType: 'CALL_ENDED',
-      endTime: endCallTime,
-      leadId: endCallLeadId,
-      leadName: endCallLeadName,
-      entityId: endCallEntityId,
+      end_time: endCallTime,
+      ...(endCallLeadId && { lead_id: endCallLeadId }),
+      ...(endCallLeadName && { lead_name: endCallLeadName }),
+      ...(endCallEntityId && { entity_id: endCallEntityId }),
     });
   } catch (e) {
     log.warn('Call end API failed:', e.message);
