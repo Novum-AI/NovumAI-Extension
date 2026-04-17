@@ -33,9 +33,11 @@ export const CONFIG = {
 
   // CRM entity resolution (unified SF + local leads)
   CRM_ENTITY_PHONE_ENDPOINT: '/api/crm/entities/phone/{phoneNumber}',
+  // Text search across SF Contact/Lead/Account for SF-connected orgs,
+  // local LeadsTable for everyone else. Returns unified entity shape.
+  CRM_ENTITY_SEARCH_ENDPOINT: '/api/crm/entities/search',
 
   // Leads
-  LEADS_SEARCH_ENDPOINT: '/api/leads/',           // GET ?search=term (partial match across phone/name/email/company)
   LEADS_PHONE_LOOKUP_ENDPOINT: '/api/leads/phone/{phoneNumber}',  // GET exact E.164 phone lookup (local only)
   LEADS_CREATE_ENDPOINT: '/api/leads/',
 

@@ -2,7 +2,14 @@
 // Creates and manages the floating overlay panel with inline SVG icons
 
 (() => {
-  if (document.getElementById('novumai-overlay')) return;
+  // A stale overlay div can survive an extension remove/reinstall because the
+  // content script's isolated world is torn down but the DOM it appended to the
+  // main world persists. If we early-return here the message listener below
+  // never registers, and every chrome.tabs.sendMessage from the SW fails with
+  // "Receiving end does not exist." Instead, tear down any stale overlay and
+  // re-initialise cleanly.
+  const staleOverlay = document.getElementById('novumai-overlay');
+  if (staleOverlay) staleOverlay.remove();
 
   // ─── Inline SVG Icons ────────────────────────────────────────────────────
   // We use inline SVGs instead of Font Awesome webfonts in the content script.
@@ -459,7 +466,6 @@
   // 3. Offscreen documents can't trigger the mic permission prompt (they're invisible)
 
   const MIC_SAMPLE_RATE = 16000;
-  const MIC_BUFFER_TARGET = 1600; // 100ms at 16kHz
 
   let micAudioContext = null;
   let micMediaStream = null;
@@ -494,46 +500,28 @@
         await micAudioContext.resume();
       }
 
-      const source = micAudioContext.createMediaStreamSource(micMediaStream);
-
-      // ScriptProcessorNode: convert float32 → PCM16 and send as base64 to service worker
-      const processor = micAudioContext.createScriptProcessor(4096, 1, 1);
-      let sampleBuffer = [];
-      let sampleCount = 0;
-
-      processor.onaudioprocess = (event) => {
-        const input = event.inputBuffer?.getChannelData(0);
-        if (!input || input.length === 0) return;
-
-        for (let i = 0; i < input.length; i++) {
-          sampleBuffer.push(input[i]);
-        }
-        sampleCount += input.length;
-
-        if (sampleCount >= MIC_BUFFER_TARGET) {
-          const int16 = new Int16Array(sampleCount);
-          for (let i = 0; i < sampleCount; i++) {
-            const s = Math.max(-1, Math.min(1, sampleBuffer[i]));
-            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-
-          const base64Audio = arrayBufferToBase64(int16.buffer);
-          chrome.runtime.sendMessage({
-            type: 'MIC_AUDIO_CHUNK',
-            target: 'background',
-            data: { audioData: base64Audio },
-          }).catch(() => {});
-
-          sampleBuffer = [];
-          sampleCount = 0;
-        }
+      // AudioWorklet off the main thread. Module URL is web-accessible per manifest.
+      const workletUrl = chrome.runtime.getURL('offscreen/pcm-processor-mic.js');
+      await micAudioContext.audioWorklet.addModule(workletUrl);
+      micProcessorNode = new AudioWorkletNode(micAudioContext, 'pcm-processor-mic');
+      micProcessorNode.port.onmessage = (event) => {
+        const buf = event.data?.audioData;
+        if (!buf) return;
+        const base64Audio = arrayBufferToBase64(buf);
+        chrome.runtime.sendMessage({
+          type: 'MIC_AUDIO_CHUNK',
+          target: 'background',
+          data: { audioData: base64Audio },
+        }).catch(() => {});
       };
 
-      source.connect(processor);
-      processor.connect(micAudioContext.destination);
-      micProcessorNode = processor;
+      const source = micAudioContext.createMediaStreamSource(micMediaStream);
+      source.connect(micProcessorNode);
+      // Deliberately NOT connected to destination — that used to route the mic back
+      // to the user's speakers (echo). AudioWorkletNode runs purely by being in the
+      // graph; no destination hookup required.
 
-      console.log('[NovumAI:Content] ✓ Mic capture started successfully');
+      console.log('[NovumAI:Content] ✓ Mic capture started (AudioWorklet)');
       return { success: true };
     } catch (e) {
       console.error('[NovumAI:Content] Mic capture failed:', e.name, e.message);
@@ -543,7 +531,7 @@
 
   function stopMicCapture() {
     if (micProcessorNode) {
-      micProcessorNode.onaudioprocess = null;
+      try { micProcessorNode.port.onmessage = null; } catch {}
       micProcessorNode.disconnect();
       micProcessorNode = null;
     }
@@ -567,11 +555,17 @@
   // ─── Message Listener ──────────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Defense in depth — reject anything not from this extension
+    if (sender.id !== chrome.runtime.id) return false;
     // Log incoming messages (except high-frequency ones like audio chunks and session state ticks)
     if (message.type !== 'SESSION_STATE' && message.type !== 'AUDIO_HEALTH') {
       console.log('[NovumAI:Content] Message received:', message.type, message.data ? Object.keys(message.data) : '');
     }
     switch (message.type) {
+      case 'PING':
+        // Readiness probe used by SW to decide whether to programmatically inject.
+        sendResponse({ ready: true });
+        return true;
       case 'SESSION_STARTED':
         console.log('[NovumAI:Content] ⚡ SESSION_STARTED — showing overlay');
         showOverlay();

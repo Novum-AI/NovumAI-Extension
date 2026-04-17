@@ -31,38 +31,6 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-function createPcmScriptProcessor(audioCtx, streamType, onChunk) {
-  // ScriptProcessorNode avoids AudioWorklet module loading/CSP issues in offscreen docs.
-  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-  let sampleBuffer = [];
-  let sampleCount = 0;
-  const targetSamples = CONFIG.BUFFER_TARGET_SAMPLES;
-
-  processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer?.getChannelData(0);
-    if (!input || input.length === 0) return;
-
-    for (let i = 0; i < input.length; i++) {
-      sampleBuffer.push(input[i]);
-    }
-    sampleCount += input.length;
-
-    if (sampleCount >= targetSamples) {
-      const int16 = new Int16Array(sampleCount);
-      for (let i = 0; i < sampleCount; i++) {
-        const s = Math.max(-1, Math.min(1, sampleBuffer[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-
-      onChunk(int16.buffer, streamType);
-      sampleBuffer = [];
-      sampleCount = 0;
-    }
-  };
-
-  return processor;
-}
-
 // ─── Tab Audio Capture ──────────────────────────────────────────────────────
 
 async function startTabAudioCapture(streamId) {
@@ -112,20 +80,28 @@ async function startTabAudioCapture(streamId) {
       await tabAudioContext.resume();
     }
 
-    const processingSource = tabAudioContext.createMediaStreamSource(tabMediaStream);
-    tabProcessorNode = createPcmScriptProcessor(tabAudioContext, 'tab', (audioData) => {
-      const base64Audio = arrayBufferToBase64(audioData);
+    // AudioWorklet runs PCM16 conversion on a dedicated audio thread — avoids the
+    // main-thread jank of the deprecated ScriptProcessorNode.
+    await tabAudioContext.audioWorklet.addModule('./pcm-processor-tab.js');
+    tabProcessorNode = new AudioWorkletNode(tabAudioContext, 'pcm-processor-tab');
+    tabProcessorNode.port.onmessage = (event) => {
+      const buf = event.data?.audioData;
+      if (!buf) return;
+      const base64Audio = arrayBufferToBase64(buf);
       chrome.runtime.sendMessage({
         type: MSG.TAB_AUDIO_CHUNK,
         target: 'background',
         data: { audioData: base64Audio },
       }).catch(() => {});
-    });
-    processingSource.connect(tabProcessorNode);
-    // Keep processor in the render graph so onaudioprocess continues firing.
-    tabProcessorNode.connect(tabAudioContext.destination);
+    };
 
-    console.log('[NovumAI Offscreen] Tab audio capture started');
+    const processingSource = tabAudioContext.createMediaStreamSource(tabMediaStream);
+    processingSource.connect(tabProcessorNode);
+    // AudioWorkletNode stays active purely by being in the render graph — it does
+    // not need a connection to the destination. The <audio> element above handles
+    // user-audible playback via an independent cloned stream.
+
+    console.log('[NovumAI Offscreen] Tab audio capture started (AudioWorklet)');
   } catch (e) {
     console.error('[NovumAI Offscreen] Tab audio capture failed:', e);
     throw e;
@@ -157,7 +133,7 @@ function startAudioHealthReporting() {
 function stopAllCapture() {
   // Tab audio
   if (tabProcessorNode) {
-    tabProcessorNode.onaudioprocess = null;
+    try { tabProcessorNode.port.onmessage = null; } catch {}
     tabProcessorNode.disconnect();
     tabProcessorNode = null;
   }
@@ -194,6 +170,7 @@ function stopAllCapture() {
 // ─── Message Listener ───────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) return false;
   if (message.target && message.target !== 'offscreen') return false;
 
   if (message.type === MSG.START_AUDIO_CAPTURE) {

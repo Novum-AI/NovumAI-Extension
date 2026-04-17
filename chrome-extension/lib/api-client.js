@@ -37,7 +37,16 @@ class ApiClient {
       throw new Error(`API ${method} ${path} failed: ${response.status} - ${errorText}`);
     }
 
-    return response.json();
+    // 204 No Content or empty body → return null rather than throwing on JSON.parse('').
+    // e.g. /api/calls/{id}/end may return an empty success body in some deployments.
+    if (response.status === 204) return null;
+    const text = await response.text();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
   }
 
   async get(path) {
@@ -93,10 +102,12 @@ class ApiClient {
     });
   }
 
-  // Leads
-  // General search: partial match across phone, name, email, company (min 2 chars)
+  // Unified CRM entity search (min 2 chars). Backend picks the source:
+  // SF-connected orgs → SOSL across Contact/Lead/Account; everyone else →
+  // local LeadsTable. Returns { entities: [{ entity_id, entity_type,
+  // source_type, first_name, last_name, email, phone, company, ... }] }.
   async searchLeads(query) {
-    const path = `${CONFIG.LEADS_SEARCH_ENDPOINT}?search=${encodeURIComponent(query)}&limit=5`;
+    const path = `${CONFIG.CRM_ENTITY_SEARCH_ENDPOINT}?q=${encodeURIComponent(query)}&limit=5`;
     return this.get(path);
   }
 
@@ -108,33 +119,6 @@ class ApiClient {
 
   async createLead(data) {
     return this.post(CONFIG.LEADS_CREATE_ENDPOINT, data);
-  }
-
-  // Session cookie check
-  async getSessionCookie() {
-    try {
-      const cookie = await chrome.cookies.get({
-        url: await this._getBaseUrl(),
-        name: CONFIG.SESSION_COOKIE_NAME,
-      });
-      return cookie?.value || null;
-    } catch (e) {
-      console.warn('[NovumAI] Could not read session cookie:', e);
-      return null;
-    }
-  }
-
-  async isAuthenticated() {
-    const cookie = await this.getSessionCookie();
-    if (!cookie) return false;
-
-    try {
-      const me = await this.getMe();
-      // /api/users/me returns user object directly with user_id field
-      return !!me?.user_id;
-    } catch {
-      return false;
-    }
   }
 }
 
